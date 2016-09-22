@@ -1,0 +1,240 @@
+---
+output: html_document
+---
+
+### Prediction project: Exercise performance classifier
+#### William Lang
+#### 2016-09-21
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### Summary
+
+We tested several prediction algorithms to predict exercise performance from data from sensors worn by users performing an exercise; subjects were instructed to perform an exercise correctly or in one of four incorrect ways. Cross-validation was used to determine model accuracy on out-of-sample data, and the execution times for the models were recorded. The boosted trees method and the k-means nearest-neighbor classification algorithms proved to be the most accurate, achieving a predicted 96% accuracy in classification on out-of-sample data. But the k-means nearest-neighbor method was substantially faster.
+
+### Introduction
+
+The goal of this project is to build and test a predictor for exercise data. The exercise data was obtained from "fitbit" style accelerometers worn by subjects performing a simple dumbbell bicep curl exercise. The subjects were instructed to perform the exercise correctly, or in one of four incorrect ways. (For example, one incorrect method was to not lower the dumbbell far enough.) The training dataset includes 19622 observations of 160 variables, including the class of exercise (the five classes given as A, B, C, D, or E).
+
+For more information, see:
+[http://groupware.les.inf.puc-rio.br/har](http://groupware.les.inf.puc-rio.br/har). This site gives a paper with a more detailed discussion: Velloso, E.; Bulling, A.; Gellersen, H.; Ugulino, W.; Fuks, H. Qualitative Activity Recognition of Weight Lifting Exercises. Proceedings of 4th International Conference in Cooperation with SIGCHI (Augmented Human '13) . Stuttgart, Germany: ACM SIGCHI, 2013.
+
+Below, we will build several algorithms, which we will compare using cross-validation. We will also note the speed of execution of these algorithms.
+
+But we will first load and prepare the training data for analysis.
+
+### Load datasets
+
+We begin by loading the data.
+
+```{r echo=FALSE}
+setwd("/Users/chris/Documents/coursera data science 8 ml/course project")
+```
+
+```{r cache=TRUE}
+training = read.csv("pml-training.csv")
+dim(training)
+```
+
+
+### Exploring the data
+
+We begin with a quick look at the structure of the dataset. We only show 20 of the 160 variables in the dataset.  
+
+```{r comment=NULL}
+str(training, list.len=20)
+```
+
+The variable to be predicted is the final variable, <code>classe</code>:
+```{r comment=NULL}
+head(training$classe, n=20)
+```
+
+Information given at the link and paper above indicates the general structure of the training dataset. It includes variables that give raw instrumentation data, such as <code>roll_belt</code>, and some derived features or variables computed from the raw data, such as <code>max_roll_belt</code>. 
+
+The raw data was collected at a sample rate of 45 Hz, and given in "windows" of 0.5 to 2.5 sec in length. The derived features or variables are given for some of the windows; these variables are mostly composed of missing values (coded as <code>NA</code>). Here is a small plot representing a typical interval of data contained in the training dataset. (This shows 225 samples, or 5 sec, of data.)
+
+```{r fig.width=5, fig.height=5}
+ind = 251:475
+x = 1:length(ind)
+y = training$pitch_arm[ind]
+plot(x,y, type="l", col="blue", ylab="arm pitch", xlab="time (45 samples/sec)")
+```
+
+Individual variables will show noticable differences between the exercise classes, as seen in the density plots of <code>pitch_arm</code> by exercise class. (But of course, only in the aggregate will the variables enable good classification and prediction.)
+
+```{r fig.width=5, fig.height=4}
+library(ggplot2)
+ggplot(training, aes(pitch_arm, colour = classe)) +
+  geom_density()
+```
+
+### Cleaning and preprocessing the data
+
+It might seem logical to base predictions on derived features, such as variables with names indicating that they are averages or variances of the corresponding raw instrument data variables (such as <code>avg_pitch_arm</code> for <code>pitch_arm</code>). 
+
+But as seen above, only a small fraction of the observations include these derived features (about 2% of the observations). So we must base our predictions only upon the raw instrument data, because test data will be unlikely to include values for those features. So here, we clean the data to remove all columns containing missing values (or the code <code>#DIV/0!</code>).
+
+```{r comment=NULL, cache=TRUE, eval=TRUE}
+vector.is.bad = function(v) {
+    if (length(v) > length(v[!is.na(v)]))
+        return(TRUE)
+    v = as.character(v) # assuming u is a factor to begin with
+    n = length(v)
+    vector.bad = FALSE
+    for (i in 1:n) {
+        if (!is.na(v[i])) {
+           if (v[i]=="#DIV/0!" | v[i]=="")
+                vector.bad = TRUE
+        } 
+    }
+    return(vector.bad)
+}
+
+nc <- ncol(training)
+bad.ind <- c()
+for (i in 1:nc) {
+    if (vector.is.bad(training[,i]))
+        bad.ind <- c(bad.ind, i)
+}
+training.clean <- training[,-bad.ind]
+# str(training.clean)
+```
+
+This leaves 60 variables.
+
+Now we scale and center the data, so that statistical learning algorithms will treat all variables alike. We also discard the first 7 variables, which are features not expected to have predictive value (such as timestamps or window "numbers"). This leaves 52 variables to base predictions on.
+
+```{r eval=TRUE}
+ind = 8:59
+for (i in ind) {
+    m <- mean(training.clean[,i])
+    s <- sd(training.clean[,i])
+    training.clean[,i] <- (training.clean[,i] - m)/s
+}
+```
+
+
+### Model selection
+
+Here, we do quick preliminary calculations, to try get a sense of what prediction models are likely to perform best. To do this, we take a single random sample of 1000 observations for a 'little' training set, and a single random sample of 1000 observations for a 'little' testing set. We fit the model to the little training set, and find the accuracy against the little testing set. This is an inadequate method of validating a model of course, and only using a small portion of the training set will likely yield a model with weaker performance. But this will guide us to the model(s) meriting full attention.
+
+
+```{r}
+k <- nrow(training.clean)
+ind <- sample(1:k,2000,replace=FALSE)
+ind1 <- ind[1:1000]
+ind2 <- ind[1001:2000]
+col.ind <- 8:60 # drop factor variables at beginning of table
+little.training <- training.clean[ind1,col.ind]
+little.testing <- training.clean[ind2,col.ind]
+training.clean <- training.clean[,col.ind]
+dim(training.clean)
+```
+
+
+```{r eval=TRUE, message=FALSE, warning=FALSE}
+library(caret)
+set.seed(6457)
+```
+
+#### Linear discriminant analysis
+
+We begin with a linear discriminant analysis classifier. We profile the code using the <code>system.time</code> function. (This has the limitation of not computing the time spent on the actual calculations, performed by C code "under the hood." But the elapsed time should reflect how much time the calculation took.)
+
+```{r eval=TRUE, cache=TRUE, message=FALSE, comment=NULL}
+system.time({
+    mod.lda = train(classe ~ ., data=little.training, method="lda")
+})
+pred.lda = predict(mod.lda, little.testing)
+confusionMatrix(pred.lda, little.testing$classe)
+```
+
+This yields an accuracy of about 0.7, and it took about 1.5 seconds.
+
+#### Decision tree
+
+A decision tree model yields poor results (only 0.357 accuracy rate), but fairly fast (3 seconds). We do not show the calculations here (and we've edited out the <code>system.time</code> function call for clarity).
+
+```{r eval=FALSE, cache=TRUE, message=FALSE, comment=NULL}
+mod.rpart = train(classe ~ ., data=little.training, method="rpart")
+pred.rpart = predict(mod.rpart, little.testing)
+confusionMatrix(pred.rpart, little.testing$classe)
+```
+
+#### Boosting
+
+We obtain much better results with boosting (the <code>gbm</code> model): about 90% accuracy. However, the method is much slower: about 100 elapsed seconds.
+
+```{r eval=FALSE, cache=TRUE, message=FALSE, comment=NULL}
+mod.gbm = train(classe ~ ., data=little.training, method="gbm",
+                verbose=FALSE)
+pred.gbm = predict(mod.gbm, little.testing)
+confusionMatrix(pred.gbm, little.testing$classe)
+```
+
+#### Random forest
+
+We now try a random forest model. This is slightly more accurate than the boosting model, at 92%. But it is considerably slower: 250 seconds.
+
+```{r eval=FALSE, cache=TRUE, message=FALSE, comment=NULL}
+mod.rf <- train(classe ~ ., data=little.training, method="rf", prox=TRUE)
+pred.rf <- predict(mod.rf, newdata=little.testing[,-53])
+confusionMatrix(pred.rf, little.testing$classe)
+```
+
+#### KNN classifier
+
+Finally, we try a k-means nearest-neighbor (or KNN) classifier. This is fast: about 4 seconds elapsed. But its accuracy is about 72% on this calculation; not as accurate tree-based methods (random forest or boosting). However, it was only tested here on only about 5% of the whole training set. We will perform cross-validation on this method below, and see much higher accuracy.
+
+```{r eval=FALSE, cache=TRUE, message=FALSE, comment=NULL}
+mod.knn <- train(classe ~ ., data=little.training, method="knn")
+pred.knn <- predict(mod.knn, newdata=little.testing[,-53])
+confusionMatrix(pred.knn, little.testing$classe)
+```
+
+### Model Validation
+
+Here, we will use k-fold cross-validation to test our final two models. One of these will be boosting, which we have seen above is very accurate and perhaps not prohibitively slow. The other will be the KNN classifier, which is very fast.
+
+We use the <code>train</code> function in the <code>caret</code> library, which automatically will try different parameters for these methods. Thus we will both build the model--select good values for tuning parameters--as well as validate them.
+
+#### Boosting
+
+We begin with boosting.
+
+```{r eval=TRUE, cache=TRUE, comment=NULL}
+system.time({
+    mod.gbm.cv = train(classe ~ ., data=training.clean, 
+                       method="gbm", verbose=FALSE,
+                       trControl=trainControl(method="cv",number=5))
+})
+print(mod.gbm.cv)
+```
+
+We see strong results: The cross-validation predicts a 96% accuracy rate on out-of-sample observations, if the tuning parameters are chosen to be <code>interaction.depth = 3</code> and <code>n.trees = 150</code>. But the calculation is fairly slow at about 379 seconds. 
+
+By the way, I attempted to perform this cross-validation for random forests. I had reason to believe it would take more than 5000 seconds. Unfortunately, an error or bug caused the code to crash after a calculation of about that long (an hour and a half).
+
+#### KNN classifier
+
+We conclude with the KNN classifier.
+
+```{r eval=TRUE, cache=TRUE, comment=NULL}
+system.time({
+    mod.knn.cv = train(classe ~ ., data=training.clean, 
+                       method="knn",
+                       trControl=trainControl(method="cv",number=5))
+})
+print(mod.knn.cv)
+```
+
+Note the accuracy is high; 97%, much higher than seen in our preliminary calculations for model selection performed on a small subset of the training data. But the <code>train</code> function has also determined the best choice for the parameter <code>k</code>, namely 5 centers. And this model is clearly faster than the boosting model; the tuning and cross-validation performed by <code>train</code> took 160 seconds.
+
+### Conclusion
+
+Based on our investigation, a good solution for the exercise classification problem appears to be the KNN classifier. With a tuning parameter of <code>k = 5</code> centers, it is very accurate---97% accurate in cross-validation. We can expect similar performance on out-of-sample data. It is also faster than tree-based methods of similar accuracy, such as the boosting method examined above.
+
+
